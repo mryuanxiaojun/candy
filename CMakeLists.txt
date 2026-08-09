@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(Candy VERSION 6.1.7)
+project(Candy VERSION 6.1.10)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -11,8 +11,6 @@ set(CMAKE_SKIP_BUILD_RPATH TRUE)
 
 if (${CANDY_STATIC})
     set(CANDY_STATIC_OPENSSL 1)
-    set(CANDY_STATIC_SPDLOG 1)
-    set(CANDY_STATIC_NLOHMANN_JSON 1)
     set(CANDY_STATIC_POCO 1)
 endif()
 
@@ -62,12 +60,6 @@ if (${CANDY_STATIC_OPENSSL})
     include_directories(${OPENSSL_INCLUDE})
 else()
     find_package(OpenSSL REQUIRED)
-endif()
-
-if (${CANDY_STATIC_SPDLOG})
-    Fetch(spdlog "https://github.com/gabime/spdlog.git" "v1.15.3")
-else()
-    find_package(spdlog REQUIRED)
 endif()
 
 if (${CANDY_STATIC_POCO})

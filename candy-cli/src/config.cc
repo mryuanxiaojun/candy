@@ -2,7 +2,14 @@
 #include "config.h"
 #include "argparse.h"
 #include "candy/candy.h"
+#include "utils/log.h"
+#include <Poco/ConsoleChannel.h>
+#include <Poco/Format.h>
+#include <Poco/FormattingChannel.h>
 #include <Poco/JSON/Object.h>
+#include <Poco/Logger.h>
+#include <Poco/Message.h>
+#include <Poco/PatternFormatter.h>
 #include <Poco/Platform.h>
 #include <Poco/String.h>
 #include <filesystem>
@@ -10,7 +17,6 @@
 #include <functional>
 #include <iostream>
 #include <map>
-#include <spdlog/spdlog.h>
 #include <sstream>
 #include <string>
 
@@ -44,23 +50,112 @@ Poco::JSON::Object arguments::json() {
 int arguments::parse(int argc, char *argv[]) {
     argparse::ArgumentParser program("candy", candy::version());
 
-    program.add_argument("-c", "--config").help("config file path");
-    program.add_argument("-m", "--mode").help("working mode");
-    program.add_argument("-w", "--websocket").help("websocket address");
-    program.add_argument("-p", "--password").help("authorization password");
-    program.add_argument("-d", "--dhcp").help("dhcp address range");
-    program.add_argument("--sdwan").help("software-defined wide area network");
-    program.add_argument("-n", "--name").help("network interface name");
-    program.add_argument("-t", "--tun").help("static address");
-    program.add_argument("-s", "--stun").help("stun address");
-    program.add_argument("--port").help("p2p listen port").scan<'i', int>();
-    program.add_argument("--mtu").help("maximum transmission unit").scan<'i', int>();
-    program.add_argument("-r", "--route").help("routing cost").scan<'i', int>();
-    program.add_argument("--discovery").help("discovery interval").scan<'i', int>();
-    program.add_argument("--localhost").help("local ip");
+    program.add_description("A simple P2P VPN / SD-WAN networking tool.");
 
-    program.add_argument("--no-timestamp").implicit_value(true);
-    program.add_argument("--debug").implicit_value(true);
+    program.add_argument("-c", "--config").help("config file path (key=value format, same keys as CLI args)").metavar("<path>");
+
+    program.add_argument("-m", "--mode").help("working mode: \"client\" or \"server\"").metavar("<mode>");
+
+    program.add_argument("-w", "--websocket")
+        .help("WebSocket signaling address (e.g. \"ws://host:port/ws\").\n"
+              "Client supports ws:// and wss://; server supports ws:// only.")
+        .metavar("<url>");
+
+    program.add_argument("-p", "--password")
+        .help("pre-shared key for authentication and P2P encryption.\n"
+              "Password is never transmitted in plaintext; only HMAC-SHA256 hashes are sent.")
+        .metavar("<secret>");
+
+    program.add_group("Client options");
+
+    program.add_argument("-n", "--name")
+        .help("TUN interface name suffix. Device will be named \"candy-<name>\".\n"
+              "Useful when running multiple clients on one host. (client only)")
+        .metavar("<iface>");
+
+    program.add_argument("-t", "--tun")
+        .help("static TUN address in CIDR notation (e.g. \"192.168.202.1/24\").\n"
+              "If omitted, the client requests a dynamic address from the server via DHCP. (client only)")
+        .metavar("<cidr>");
+
+    program.add_argument("-s", "--stun")
+        .help("STUN server address for NAT traversal (e.g. \"stun://stun.example.org\").\n"
+              "If omitted: P2P works only on the local network (LAN);\n"
+              "public internet peer-to-peer connections will fail.\n"
+              "Also disables periodic discovery broadcasts. (client only)")
+        .metavar("<url>");
+
+    program.add_argument("--port")
+        .help("local UDP port for P2P communication.\n"
+              "Default is 0 (OS assigns a random port).\n"
+              "Specify a fixed port when firewall rules require it. (client only)")
+        .metavar("<int>")
+        .scan<'i', int>()
+        .default_value(0)
+        .nargs(1);
+
+    program.add_argument("--mtu")
+        .help("maximum transmission unit for the TUN device.\n"
+              "Default is 1400. (client only)")
+        .metavar("<int>")
+        .scan<'i', int>()
+        .default_value(1400)
+        .nargs(1);
+
+    program.add_argument("-r", "--route")
+        .help("routing cost (0-1000), added to measured RTT when advertising routes.\n"
+              "Default is 0 (relay disabled): this node does not forward traffic for other peers.\n"
+              "Set > 0 to enable relay mode. (client only)")
+        .metavar("<int>")
+        .scan<'i', int>()
+        .default_value(0)
+        .nargs(1);
+
+    program.add_argument("--discovery")
+        .help("periodic P2P discovery interval in seconds.\n"
+              "Default is 0 (disabled). Requires STUN to be configured.\n"
+              "When enabled, periodically broadcasts discovery to trigger P2P attempts. (client only)")
+        .metavar("<int>")
+        .scan<'i', int>()
+        .default_value(0)
+        .nargs(1);
+
+    program.add_argument("--localhost")
+        .help("local IPv4 address used for P2P peering.\n"
+              "If omitted, auto-detected from the first physical network interface. (client only)")
+        .metavar("<ip>");
+
+    program.add_group("Server options");
+
+    program.add_argument("-d", "--dhcp")
+        .help("DHCP address pool for dynamic client address allocation\n"
+              "(e.g. \"192.168.202.0/24\"). Also enables directed broadcast detection.\n"
+              "If omitted, clients must use a static --tun address. (server only)")
+        .metavar("<cidr>");
+
+    program.add_argument("--sdwan")
+        .help("software-defined routing rules.\n"
+              "Format: \"dev_cidr,dst_cidr,nexthop;...\" (semicolon-separated).\n"
+              "Pushes sys route entries to matching clients on connect. (server only)")
+        .metavar("<rules>");
+
+    program.add_group("Logging options");
+
+    program.add_argument("--no-timestamp")
+        .help("omit timestamps from log output (shows only log level and message).")
+        .implicit_value(true);
+
+    program.add_argument("--debug").help("enable debug-level logging.").implicit_value(true);
+
+    program.add_epilog("Examples:\n"
+                       "  Client with static address:\n"
+                       "    candy -m client -w wss://server.example.com/ws -p mysecret -t 192.168.202.1/24\n"
+                       "  Client with DHCP (dynamic address):\n"
+                       "    candy -m client -w wss://server.example.com/ws -p mysecret -s stun://stun.example.com\n"
+                       "  Server:\n"
+                       "    candy -m server -w ws://0.0.0.0:8080/ws -p mysecret -d 192.168.202.0/24\n"
+                       "  Using config file:\n"
+                       "    candy -c candy.cfg");
 
     try {
         program.parse_args(argc, argv);
@@ -102,11 +197,23 @@ int arguments::parse(int argc, char *argv[]) {
             exit(1);
         }
 
+        // Set up default console channel with pattern
         if (this->noTimestamp) {
-            spdlog::set_pattern("[%^%l%$] %v");
+            Poco::AutoPtr<Poco::PatternFormatter> pFormatter = new Poco::PatternFormatter("[%q] %t");
+            Poco::AutoPtr<Poco::FormattingChannel> pFormattingChannel = new Poco::FormattingChannel(pFormatter);
+            Poco::AutoPtr<Poco::ConsoleChannel> pConsoleChannel = new Poco::ConsoleChannel;
+            pFormattingChannel->setChannel(pConsoleChannel);
+            Poco::Logger::root().setChannel(pFormattingChannel);
+        } else {
+            Poco::AutoPtr<Poco::PatternFormatter> pFormatter = new Poco::PatternFormatter("%Y-%m-%d %H:%M:%S [%q] %t");
+            Poco::AutoPtr<Poco::FormattingChannel> pFormattingChannel = new Poco::FormattingChannel(pFormatter);
+            Poco::AutoPtr<Poco::ConsoleChannel> pConsoleChannel = new Poco::ConsoleChannel;
+            pFormattingChannel->setChannel(pConsoleChannel);
+            Poco::Logger::root().setChannel(pFormattingChannel);
         }
+
         if (this->debug) {
-            spdlog::set_level(spdlog::level::debug);
+            Poco::Logger::root().setLevel(Poco::Message::PRIO_DEBUG);
         }
         return 0;
     } catch (const std::exception &e) {
@@ -145,11 +252,11 @@ void arguments::parseFile(std::string cfgFile) {
             if (handler != cfgHandlers.end()) {
                 handler->second(trim(cfg.second));
             } else {
-                spdlog::warn("unknown config: {}={}", cfg.first, cfg.second);
+                candy::logger().warning(Poco::format("unknown config: %s=%s", cfg.first, cfg.second));
             }
         }
     } catch (std::exception &e) {
-        spdlog::error("parse config file failed: {}", e.what());
+        candy::logger().error(Poco::format("parse config file failed: %s", std::string(e.what())));
         exit(1);
     }
 }
@@ -186,7 +293,7 @@ int saveTunAddress(const std::string &name, const std::string &cidr) {
         }
         return 0;
     } catch (std::exception &e) {
-        spdlog::critical("save latest address failed: {}", e.what());
+        candy::logger().fatal(Poco::format("save latest address failed: %s", std::string(e.what())));
         return -1;
     }
 }
@@ -239,24 +346,24 @@ std::string initVirtualMac() {
         }
         return vmac;
     } catch (std::exception &e) {
-        spdlog::critical("init vmac failed: {}", e.what());
+        candy::logger().fatal(Poco::format("init vmac failed: %s", std::string(e.what())));
         return "";
     }
 }
 
 std::string virtualMac(const std::string &name) {
     std::string path;
-    // 兼容老版本,优先获取与配置网卡名对应的 vmac
+    // Compatibility with older versions: prefer interface-name-specific vmac
     path = virtualMacHelper(name);
     if (!path.empty()) {
         return path;
     }
-    // 获取网卡名无关的全局 vmac
+    // Fall back to global vmac (unrelated to interface name)
     path = virtualMacHelper();
     if (!path.empty()) {
         return path;
     }
-    // 初次启动,生成全局 vmac
+    // First run: generate a global vmac
     return initVirtualMac();
 }
 

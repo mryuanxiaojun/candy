@@ -4,8 +4,11 @@
 #include "core/message.h"
 #include "core/net.h"
 #include "core/version.h"
+#include "utils/hex.h"
+#include "utils/log.h"
 #include "utils/time.h"
 #include "websocket/message.h"
+#include <Poco/Format.h>
 #include <Poco/Net/HTTPMessage.h>
 #include <Poco/Net/HTTPRequest.h>
 #include <Poco/Net/HTTPResponse.h>
@@ -13,8 +16,6 @@
 #include <Poco/Timespan.h>
 #include <Poco/URI.h>
 #include <memory>
-#include <spdlog/fmt/bin_to_hex.h>
-#include <spdlog/spdlog.h>
 
 namespace candy {
 
@@ -56,7 +57,7 @@ int WebSocketClient::run(Client *client) {
     this->client = client;
 
     if (connect()) {
-        spdlog::critical("websocket client connect failed");
+        candy::logger().fatal("websocket client connect failed");
         return -1;
     }
 
@@ -68,23 +69,28 @@ int WebSocketClient::run(Client *client) {
     }
 
     this->msgThread = std::thread([&] {
-        spdlog::debug("start thread: websocket client msg");
-        while (getClient().isRunning()) {
-            handleWsQueue();
+        candy::logger().debug("start thread: websocket client msg");
+        try {
+            while (getClient().isRunning()) {
+                handleWsQueue();
+            }
+            getClient().shutdown();
+        } catch (const std::exception &e) {
+            candy::logger().error(Poco::format("websocket msg thread exception: %s", std::string(e.what())));
+            getClient().shutdown();
         }
-        getClient().shutdown();
-        spdlog::debug("stop thread: websocket client msg");
+        candy::logger().debug("stop thread: websocket client msg");
     });
 
     this->wsThread = std::thread([&] {
-        spdlog::debug("start thread: websocket client ws");
+        candy::logger().debug("start thread: websocket client ws");
         while (getClient().isRunning()) {
             if (handleWsConn()) {
                 break;
             }
         }
         getClient().shutdown();
-        spdlog::debug("stop thread: websocket client ws");
+        candy::logger().debug("stop thread: websocket client ws");
     });
 
     return 0;
@@ -115,7 +121,7 @@ void WebSocketClient::handleWsQueue() {
         handleDiscovery(std::move(msg));
         break;
     default:
-        spdlog::warn("unexcepted websocket message type: {}", static_cast<int>(msg.kind));
+        candy::logger().warning(Poco::format("unexcepted websocket message type: %d", static_cast<int>(msg.kind)));
         break;
     }
 }
@@ -157,7 +163,7 @@ int WebSocketClient::handleWsConn() {
 
         if (!this->ws->poll(Poco::Timespan(1, 0), Poco::Net::Socket::SELECT_READ | Poco::Net::Socket::SELECT_ERROR)) {
             if (bootTime() - this->timestamp > 30000) {
-                spdlog::warn("websocket pong timeout");
+                candy::logger().warning("websocket pong timeout");
                 return -1;
             }
             if (bootTime() - this->timestamp > 15000) {
@@ -167,14 +173,14 @@ int WebSocketClient::handleWsConn() {
         }
 
         if (this->ws->getError()) {
-            spdlog::warn("websocket connection error: {}", this->ws->getError());
+            candy::logger().warning(Poco::format("websocket connection error: %d", this->ws->getError()));
             return -1;
         }
 
         buffer.resize(1500);
         int length = this->ws->receiveFrame(buffer.data(), buffer.size(), flags);
         if (length == 0 && flags == 0) {
-            spdlog::info("abnormal disconnect");
+            candy::logger().information("abnormal disconnect");
             return -1;
         }
         if ((flags & Poco::Net::WebSocket::FRAME_OP_BITMASK) == Poco::Net::WebSocket::FRAME_OP_PING) {
@@ -188,7 +194,7 @@ int WebSocketClient::handleWsConn() {
             return 0;
         }
         if ((flags & Poco::Net::WebSocket::FRAME_OP_BITMASK) == Poco::Net::WebSocket::FRAME_OP_CLOSE) {
-            spdlog::info("websocket close: {}", buffer);
+            candy::logger().information(Poco::format("websocket close: %s", buffer));
             return -1;
         }
         if (length > 0) {
@@ -199,7 +205,7 @@ int WebSocketClient::handleWsConn() {
         }
         return 0;
     } catch (std::exception &e) {
-        spdlog::warn("handle ws conn failed: {}", e.what());
+        candy::logger().warning(Poco::format("handle ws conn failed: %s", std::string(e.what())));
         return -1;
     }
 }
@@ -226,29 +232,30 @@ void WebSocketClient::handleWsMsg(std::string buffer) {
         handleGeneralMsg(std::move(buffer));
         break;
     default:
-        spdlog::debug("unknown websocket message kind: {}", msgKind);
+        candy::logger().debug(Poco::format("unknown websocket message kind: %u", msgKind));
         break;
     }
 }
 
 void WebSocketClient::handleForwardMsg(std::string buffer) {
     if (buffer.size() < sizeof(WsMsg::Forward)) {
-        spdlog::warn("invalid forward message: {:n}", spdlog::to_hex(buffer));
+        candy::logger().warning(Poco::format("invalid forward message: %s", to_hex(buffer)));
         return;
     }
-    // 移除一个字节的类型
+    // Remove the 1-byte type field
     buffer.erase(0, 1);
-    // 尝试与源地址建立对等连接
+    // Try to establish a peer-to-peer connection with the source address
     IP4Header *header = (IP4Header *)buffer.data();
-    // 每次通过服务端转发收到报文都触发一次尝试 P2P 连接, 用于暗示通过服务端转发是个非常耗时的操作
+    // Each relayed packet from the server triggers a P2P attempt,
+    // since server forwarding is a high-latency operation
     this->client->getPeerMsgQueue().write(Msg(MsgKind::TRYP2P, header->saddr.toString()));
-    // 最后把报文移动到 TUN 模块, 因为有移动操作所以必须在最后执行
+    // Move the packet to the TUN module last, since std::move is destructive
     this->client->getTunMsgQueue().write(Msg(MsgKind::PACKET, std::move(buffer)));
 }
 
 void WebSocketClient::handleExptTunMsg(std::string buffer) {
     if (buffer.size() < sizeof(WsMsg::ExptTun)) {
-        spdlog::warn("invalid expt tun message: {:n}", spdlog::to_hex(buffer));
+        candy::logger().warning(Poco::format("invalid expt tun message: %s", to_hex(buffer)));
         return;
     }
     WsMsg::ExptTun *header = (WsMsg::ExptTun *)buffer.data();
@@ -259,7 +266,7 @@ void WebSocketClient::handleExptTunMsg(std::string buffer) {
 
 void WebSocketClient::handleUdp4ConnMsg(std::string buffer) {
     if (buffer.size() < sizeof(WsMsg::Conn)) {
-        spdlog::warn("invalid udp4conn message: {:n}", spdlog::to_hex(buffer));
+        candy::logger().warning(Poco::format("invalid udp4conn message: %s", to_hex(buffer)));
         return;
     }
     WsMsg::Conn *header = (WsMsg::Conn *)buffer.data();
@@ -269,7 +276,7 @@ void WebSocketClient::handleUdp4ConnMsg(std::string buffer) {
 
 void WebSocketClient::handleDiscoveryMsg(std::string buffer) {
     if (buffer.size() < sizeof(WsMsg::Discovery)) {
-        spdlog::warn("invalid discovery message: {:n}", spdlog::to_hex(buffer));
+        candy::logger().warning(Poco::format("invalid discovery message: %s", to_hex(buffer)));
         return;
     }
     WsMsg::Discovery *header = (WsMsg::Discovery *)buffer.data();
@@ -281,7 +288,7 @@ void WebSocketClient::handleDiscoveryMsg(std::string buffer) {
 
 void WebSocketClient::handleRouteMsg(std::string buffer) {
     if (buffer.size() < sizeof(WsMsg::SysRoute)) {
-        spdlog::warn("invalid route message: {:n}", spdlog::to_hex(buffer));
+        candy::logger().warning(Poco::format("invalid route message: %s", to_hex(buffer)));
         return;
     }
     WsMsg::SysRoute *header = (WsMsg::SysRoute *)buffer.data();
@@ -294,7 +301,7 @@ void WebSocketClient::handleRouteMsg(std::string buffer) {
 
 void WebSocketClient::handleGeneralMsg(std::string buffer) {
     if (buffer.size() < sizeof(WsMsg::ConnLocal)) {
-        spdlog::warn("invalid udp4conn local message: {:n}", spdlog::to_hex(buffer));
+        candy::logger().warning(Poco::format("invalid udp4conn local message: %s", to_hex(buffer)));
         return;
     }
     WsMsg::ConnLocal *header = (WsMsg::ConnLocal *)buffer.data();
@@ -317,7 +324,7 @@ void WebSocketClient::sendFrame(const void *buffer, int length, int flags) {
         try {
             this->ws->sendFrame(buffer, length, flags);
         } catch (std::exception &e) {
-            spdlog::critical("websocket send frame failed: {}", e.what());
+            candy::logger().fatal(Poco::format("websocket send frame failed: %s", std::string(e.what())));
         }
     }
 }
@@ -373,7 +380,7 @@ int WebSocketClient::connect() {
     try {
         uri = std::make_shared<Poco::URI>(wsServerUri);
     } catch (std::exception &e) {
-        spdlog::critical("invalid websocket server: {}: {}", wsServerUri, e.what());
+        candy::logger().fatal(Poco::format("invalid websocket server: %s: %s", wsServerUri, std::string(e.what())));
         return -1;
     }
 
@@ -390,17 +397,17 @@ int WebSocketClient::connect() {
             Poco::Net::HTTPClientSession cs(uri->getHost(), uri->getPort());
             this->ws = std::make_shared<Poco::Net::WebSocket>(cs, request, response);
         } else {
-            spdlog::critical("invalid websocket scheme: {}", wsServerUri);
+            candy::logger().fatal(Poco::format("invalid websocket scheme: %s", wsServerUri));
             return -1;
         }
         // Blocking mode may cause receiveFrame to hang and use 100% CPU
         this->ws->setBlocking(false);
         this->timestamp = bootTime();
-        this->pingMessage = fmt::format("candy::{}::{}::{}", CANDY_SYSTEM, CANDY_VERSION, hostName());
-        spdlog::debug("client info: {}", this->pingMessage);
+        this->pingMessage = "candy::" + std::string(CANDY_SYSTEM) + "::" + std::string(CANDY_VERSION) + "::" + hostName();
+        candy::logger().debug(Poco::format("client info: %s", this->pingMessage));
         return 0;
     } catch (std::exception &e) {
-        spdlog::critical("websocket connect failed: {}", e.what());
+        candy::logger().fatal(Poco::format("websocket connect failed: %s", std::string(e.what())));
         return -1;
     }
 }
@@ -413,7 +420,7 @@ int WebSocketClient::disconnect() {
             this->ws.reset();
         }
     } catch (std::exception &e) {
-        spdlog::debug("websocket disconnect failed: {}", e.what());
+        candy::logger().debug(Poco::format("websocket disconnect failed: %s", std::string(e.what())));
     }
     return 0;
 }

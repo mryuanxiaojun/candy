@@ -7,8 +7,6 @@
 #include "utils/codecvt.h"
 #include <memory>
 #include <openssl/sha.h>
-#include <spdlog/fmt/bin_to_hex.h>
-#include <spdlog/spdlog.h>
 #include <stack>
 #include <string>
 // clang-format off
@@ -28,6 +26,9 @@
 #pragma GCC diagnostic ignored "-Wunknown-pragmas"
 #include <wintun.h>
 #pragma GCC diagnostic pop
+#include "utils/hex.h"
+#include "utils/log.h"
+#include <Poco/Format.h>
 
 namespace candy {
 
@@ -57,7 +58,7 @@ private:
     Holder() {
         this->wintun = LoadLibraryExW(L"wintun.dll", NULL, LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
         if (!this->wintun) {
-            spdlog::critical("load wintun.dll failed");
+            candy::logger().fatal("load wintun.dll failed");
             return;
         }
 #pragma GCC diagnostic push
@@ -70,7 +71,7 @@ private:
 #undef X
 #pragma GCC diagnostic pop
         {
-            spdlog::critical("get function from wintun.dll failed");
+            candy::logger().fatal("get function from wintun.dll failed");
             FreeLibrary(this->wintun);
             this->wintun = NULL;
             return;
@@ -88,24 +89,9 @@ private:
     HMODULE wintun = NULL;
 };
 
-class WindowsTun {
-public:
+struct Tun::Impl {
     int setName(const std::string &name) {
         this->name = name.empty() ? "candy" : name;
-        return 0;
-    }
-
-    int setIP(IP4 ip) {
-        this->ip = ip;
-        return 0;
-    }
-
-    IP4 getIP() {
-        return this->ip;
-    }
-
-    int setPrefix(uint32_t prefix) {
-        this->prefix = prefix;
         return 0;
     }
 
@@ -114,9 +100,9 @@ public:
         return 0;
     }
 
-    int up() {
+    int up(IP4 ip, IP4 mask) {
         if (!Holder::Ok()) {
-            spdlog::critical("init wintun failed");
+            candy::logger().fatal("init wintun failed");
             return -1;
         }
 
@@ -127,7 +113,7 @@ public:
         memcpy(&Guid, hash, sizeof(Guid));
         this->adapter = WintunCreateAdapter(UTF8ToUTF16(this->name).c_str(), L"Candy", &Guid);
         if (!this->adapter) {
-            spdlog::critical("create wintun adapter failed: {}", GetLastError());
+            candy::logger().fatal(Poco::format("create wintun adapter failed: %lu", GetLastError()));
             return -1;
         }
         int Error;
@@ -135,12 +121,12 @@ public:
         InitializeUnicastIpAddressEntry(&AddressRow);
         WintunGetAdapterLUID(this->adapter, &AddressRow.InterfaceLuid);
         AddressRow.Address.Ipv4.sin_family = AF_INET;
-        AddressRow.Address.Ipv4.sin_addr.S_un.S_addr = this->ip;
-        AddressRow.OnLinkPrefixLength = this->prefix;
+        AddressRow.Address.Ipv4.sin_addr.S_un.S_addr = ip;
+        AddressRow.OnLinkPrefixLength = mask.toPrefix();
         AddressRow.DadState = IpDadStatePreferred;
         Error = CreateUnicastIpAddressEntry(&AddressRow);
         if (Error != ERROR_SUCCESS) {
-            spdlog::critical("create unicast ip address entry failed: {}", Error);
+            candy::logger().fatal(Poco::format("create unicast ip address entry failed: %d", Error));
             return -1;
         }
 
@@ -149,7 +135,7 @@ public:
         Interface.InterfaceLuid = AddressRow.InterfaceLuid;
         Error = GetIpInterfaceEntry(&Interface);
         if (Error != NO_ERROR) {
-            spdlog::critical("get ip interface entry failed: {}", Error);
+            candy::logger().fatal(Poco::format("get ip interface entry failed: %d", Error));
             return -1;
         }
         this->ifindex = Interface.InterfaceIndex;
@@ -157,13 +143,13 @@ public:
         Interface.NlMtu = this->mtu;
         Error = SetIpInterfaceEntry(&Interface);
         if (Error != NO_ERROR) {
-            spdlog::critical("set ip interface entry failed: {}", Error);
+            candy::logger().fatal(Poco::format("set ip interface entry failed: %d", Error));
             return -1;
         }
 
         this->session = WintunStartSession(this->adapter, WINTUN_MIN_RING_CAPACITY);
         if (!this->session) {
-            spdlog::critical("start wintun session failed: {}", GetLastError());
+            candy::logger().fatal(Poco::format("start wintun session failed: %lu", GetLastError()));
             return -1;
         }
         return 0;
@@ -199,7 +185,7 @@ public:
                 WaitForSingleObject(WintunGetReadWaitEvent(this->session), 1000);
                 return 0;
             }
-            spdlog::error("wintun read failed: {}", GetLastError());
+            candy::logger().error(Poco::format("wintun read failed: %lu", GetLastError()));
         }
         return -1;
     }
@@ -215,7 +201,7 @@ public:
             if (GetLastError() == ERROR_BUFFER_OVERFLOW) {
                 return 0;
             }
-            spdlog::error("wintun write failed: {}", GetLastError());
+            candy::logger().error(Poco::format("wintun write failed: %lu", GetLastError()));
         }
         return -1;
     }
@@ -242,7 +228,7 @@ public:
         if (result == NO_ERROR) {
             routes.push(route);
         } else {
-            spdlog::error("add route failed: {}", result);
+            candy::logger().error(Poco::format("add route failed: %lu", result));
         }
 
         return 0;
@@ -250,10 +236,7 @@ public:
 
 private:
     std::string name;
-    IP4 ip;
-    uint32_t prefix;
     int mtu;
-    int timeout;
     NET_IFINDEX ifindex;
     std::stack<MIB_IPFORWARDROW> routes;
 
@@ -261,87 +244,38 @@ private:
     WINTUN_SESSION_HANDLE session = NULL;
 };
 
-} // namespace candy
-
-namespace candy {
-
 Tun::Tun() {
-    this->impl = std::make_shared<WindowsTun>();
+    this->impl = std::make_unique<Impl>();
 }
 
-Tun::~Tun() {
-    this->impl.reset();
-}
+Tun::~Tun() {}
 
 int Tun::setName(const std::string &name) {
-    std::shared_ptr<WindowsTun> tun;
-
-    tun = std::any_cast<std::shared_ptr<WindowsTun>>(this->impl);
-    tun->setName(name);
-    return 0;
-}
-
-int Tun::setAddress(const std::string &cidr) {
-    std::shared_ptr<WindowsTun> tun;
-    Address address;
-
-    if (address.fromCidr(cidr)) {
-        return -1;
-    }
-    spdlog::info("client address: {}", address.toCidr());
-    tun = std::any_cast<std::shared_ptr<WindowsTun>>(this->impl);
-    if (tun->setIP(address.Host())) {
-        return -1;
-    }
-    if (tun->setPrefix(address.Mask().toPrefix())) {
-        return -1;
-    }
-    return 0;
-}
-
-IP4 Tun::getIP() {
-    std::shared_ptr<WindowsTun> tun;
-    tun = std::any_cast<std::shared_ptr<WindowsTun>>(this->impl);
-    return tun->getIP();
+    return this->impl->setName(name);
 }
 
 int Tun::setMTU(int mtu) {
-    std::shared_ptr<WindowsTun> tun;
-    tun = std::any_cast<std::shared_ptr<WindowsTun>>(this->impl);
-    if (tun->setMTU(mtu)) {
-        return -1;
-    }
-    return 0;
+    return this->impl->setMTU(mtu);
 }
 
 int Tun::up() {
-    std::shared_ptr<WindowsTun> tun;
-    tun = std::any_cast<std::shared_ptr<WindowsTun>>(this->impl);
-    return tun->up();
+    return this->impl->up(this->ip, this->mask);
 }
 
 int Tun::down() {
-    std::shared_ptr<WindowsTun> tun;
-    tun = std::any_cast<std::shared_ptr<WindowsTun>>(this->impl);
-    return tun->down();
+    return this->impl->down();
 }
 
 int Tun::read(std::string &buffer) {
-    std::shared_ptr<WindowsTun> tun;
-    tun = std::any_cast<std::shared_ptr<WindowsTun>>(this->impl);
-    return tun->read(buffer);
+    return this->impl->read(buffer);
 }
 
 int Tun::write(const std::string &buffer) {
-    std::shared_ptr<WindowsTun> tun;
-    tun = std::any_cast<std::shared_ptr<WindowsTun>>(this->impl);
-    return tun->write(buffer);
+    return this->impl->write(buffer);
 }
 
 int Tun::setSysRtTable(IP4 dst, IP4 mask, IP4 nexthop) {
-    std::shared_ptr<WindowsTun> tun;
-    tun = std::any_cast<std::shared_ptr<WindowsTun>>(this->impl);
-    return tun->setSysRtTable(dst, mask, nexthop);
+    return this->impl->setSysRtTable(dst, mask, nexthop);
 }
 
 } // namespace candy

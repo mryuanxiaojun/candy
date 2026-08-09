@@ -4,8 +4,8 @@
 
 #include "core/message.h"
 #include "core/net.h"
-#include <any>
 #include <list>
+#include <memory>
 #include <shared_mutex>
 #include <string>
 #include <thread>
@@ -25,15 +25,18 @@ public:
     int run(Client *client);
     int wait();
 
-    IP4 getIP();
+    IP4 getIP() const;
+    IP4 getMask() const;
 
 private:
     int setAddress(const std::string &cidr);
+    bool inTunNetwork(IP4 addr) const;
+    bool invalidSrcDst(const IP4Header &header) const;
 
-    // 处理来自 TUN 设备的数据
+    // Process data from the TUN device
     int handleTunDevice();
 
-    // 处理来自消息队列的数据
+    // Process data from the message queue
     int handleTunQueue();
     int handlePacket(Msg msg);
     int handleTunAddr(Msg msg);
@@ -57,7 +60,10 @@ private:
     std::list<SysRouteEntry> sysRtTable;
 
 private:
-    std::any impl;
+    struct Impl;
+    std::unique_ptr<Impl> impl;
+    IP4 ip;
+    IP4 mask;
 
 private:
     Client &getClient();
